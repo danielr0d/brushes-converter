@@ -1,0 +1,10 @@
+[package]
+name = "brushes converter"
+version = "0"
+authors = ["Daniel Rodrigues <danielrpereira.98@gmail.com>"]
+edition = "2025"
+publish = false
+
+[dependencies]
+iced.workspace = true
+
