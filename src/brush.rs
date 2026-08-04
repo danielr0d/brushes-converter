@@ -1,7 +1,5 @@
 use eframe::egui;
 
-/// Raw RGBA pixel buffer for a brush tip or texture stamp, in a form every
-/// format-specific parser produces and `egui` can render directly.
 pub struct RasterImage {
     pub width: u32,
     pub height: u32,
@@ -17,8 +15,6 @@ impl RasterImage {
     }
 }
 
-/// Universal brush representation. Every format reader (Procreate, ABR,
-/// Clip Studio, ...) converts into this, and every writer converts out of it.
 pub struct IntermediateBrush {
     pub name: String,
     pub tip: RasterImage,
