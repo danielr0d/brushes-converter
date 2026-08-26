@@ -1,2 +1,6 @@
 /.idea
 target/
+
+# Reference sample files (also present, tracked, under tests/fixtures/)
+/RakeBrushpackPhotoshopFinal.abr
+/Rake_Brushpack.brushset
