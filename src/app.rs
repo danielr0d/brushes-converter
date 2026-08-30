@@ -15,7 +15,7 @@ impl Default for App {
         App {
             brush_set: None,
             textures: Vec::new(),
-            status: "Drop a .brush or .brushset file here".to_string(),
+            status: "Drop a brush file here, or click \"Open file…\"".to_string(),
             error: None,
         }
     }
@@ -48,6 +48,24 @@ impl App {
             Err(err) => {
                 self.error = Some(err.to_string());
             }
+        }
+    }
+
+    fn open_file_dialog(&mut self, ctx: &egui::Context) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Open brush file")
+            .add_filter(
+                "Brush files",
+                &["brush", "brushset", "abr", "sut", "kbr", "bundle"],
+            )
+            .add_filter("All files", &["*"])
+            .pick_file()
+        else {
+            return;
+        };
+        match std::fs::read(&path) {
+            Ok(bytes) => self.load(ctx, path, bytes),
+            Err(err) => self.error = Some(err.to_string()),
         }
     }
 
@@ -85,7 +103,12 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.label(&self.status);
+            ui.horizontal(|ui| {
+                if ui.button("Open file…").clicked() {
+                    self.open_file_dialog(ctx);
+                }
+                ui.label(&self.status);
+            });
             if let Some(err) = &self.error {
                 ui.colored_label(egui::Color32::RED, err);
             }
@@ -111,7 +134,7 @@ impl eframe::App for App {
                     self.export_as_abr();
                 }
             } else {
-                ui.label("(drag and drop a Procreate .brush or .brushset file)");
+                ui.label("(drag and drop a brush file, or click \"Open file…\")");
             }
         });
     }
