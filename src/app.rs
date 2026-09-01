@@ -1,4 +1,4 @@
-use crate::formats::{self, abr};
+use crate::formats::{self, abr, folder};
 use crate::schema::BrushSet;
 use eframe::egui;
 use std::path::PathBuf;
@@ -86,6 +86,23 @@ impl App {
             Err(err) => self.error = Some(err.to_string()),
         }
     }
+
+    fn export_as_folder(&mut self) {
+        let Some(brush_set) = &self.brush_set else { return };
+        let Some(dir) = rfd::FileDialog::new()
+            .set_title("Choose export folder")
+            .pick_folder()
+        else {
+            return;
+        };
+        match folder::export(brush_set, &dir) {
+            Ok(()) => {
+                self.status = format!("Exported to {}", dir.display());
+                self.error = None;
+            }
+            Err(err) => self.error = Some(err.to_string()),
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -130,9 +147,14 @@ impl eframe::App for App {
                 });
 
                 ui.separator();
-                if ui.button("Export as .abr…").clicked() {
-                    self.export_as_abr();
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("Export as .abr…").clicked() {
+                        self.export_as_abr();
+                    }
+                    if ui.button("Export as folder…").clicked() {
+                        self.export_as_folder();
+                    }
+                });
             } else {
                 ui.label("(drag and drop a brush file, or click \"Open file…\")");
             }

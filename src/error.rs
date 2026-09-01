@@ -14,6 +14,9 @@ pub enum ConverterError {
     #[error("plist error: {0}")]
     Plist(#[from] plist::Error),
 
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+
     #[error("malformed brush archive: {0}")]
     Malformed(String),
 

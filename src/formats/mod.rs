@@ -1,5 +1,6 @@
 pub mod abr;
 pub mod csp;
+pub mod folder;
 pub mod krita;
 pub mod procreate;
 
