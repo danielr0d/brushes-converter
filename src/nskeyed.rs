@@ -13,7 +13,7 @@
 //! Procreate stores, resolving `Uid` references is sufficient.
 
 use crate::error::{ConverterError, Result};
-use plist::Value;
+use plist::{Uid, Value};
 use std::io::Cursor;
 
 const MAX_DEPTH: usize = 64;
@@ -116,6 +116,68 @@ pub trait ValueExt {
     fn field_f64(&self, key: &str) -> Option<f64>;
     fn field_bool(&self, key: &str) -> Option<bool>;
     fn field_str(&self, key: &str) -> Option<&str>;
+}
+
+/// Builds a minimal NSKeyedArchiver-shaped binary plist whose `$top.root`
+/// object is a dictionary with `fields` inlined directly (no per-value `Uid`
+/// indirection) — the mirror image of what [`decode_root`]'s `resolve` step
+/// already accepts, since it passes non-`Uid` values through unchanged. This
+/// is our own self-consistent construction, not a byte-exact reproduction of
+/// real `NSCoding` class-based archiving (see module docs); good enough for
+/// [`decode_root`] to read back, best-effort for a real Procreate install.
+pub fn encode_root(fields: &serde_json::Map<String, serde_json::Value>) -> Result<Vec<u8>> {
+    let mut root_dict = plist::Dictionary::new();
+    for (key, value) in fields {
+        if let Some(plist_value) = json_to_plist(value) {
+            root_dict.insert(key.clone(), plist_value);
+        }
+    }
+
+    let mut top = plist::Dictionary::new();
+    top.insert("root".to_string(), Value::Uid(Uid::new(1)));
+
+    let mut root = plist::Dictionary::new();
+    root.insert("$version".to_string(), Value::Integer(100_000i64.into()));
+    root.insert(
+        "$archiver".to_string(),
+        Value::String("NSKeyedArchiver".to_string()),
+    );
+    root.insert("$top".to_string(), Value::Dictionary(top));
+    root.insert(
+        "$objects".to_string(),
+        Value::Array(vec![
+            Value::String("$null".to_string()),
+            Value::Dictionary(root_dict),
+        ]),
+    );
+
+    let mut buf = Vec::new();
+    Value::Dictionary(root).to_writer_binary(&mut buf)?;
+    Ok(buf)
+}
+
+fn json_to_plist(value: &serde_json::Value) -> Option<Value> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(b) => Some(Value::Boolean(*b)),
+        serde_json::Value::Number(n) => match n.as_i64() {
+            Some(i) => Some(Value::Integer(i.into())),
+            None => n.as_f64().map(Value::Real),
+        },
+        serde_json::Value::String(s) => Some(Value::String(s.clone())),
+        serde_json::Value::Array(items) => {
+            Some(Value::Array(items.iter().filter_map(json_to_plist).collect()))
+        }
+        serde_json::Value::Object(map) => {
+            let mut dict = plist::Dictionary::new();
+            for (k, v) in map {
+                if let Some(plist_value) = json_to_plist(v) {
+                    dict.insert(k.clone(), plist_value);
+                }
+            }
+            Some(Value::Dictionary(dict))
+        }
+    }
 }
 
 impl ValueExt for Value {

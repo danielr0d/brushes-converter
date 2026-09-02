@@ -1,4 +1,4 @@
-use crate::formats::{self, abr, folder};
+use crate::formats::{self, abr, folder, procreate};
 use crate::schema::BrushSet;
 use eframe::egui;
 use std::path::PathBuf;
@@ -87,6 +87,24 @@ impl App {
         }
     }
 
+    fn export_as_brushset(&mut self) {
+        let Some(brush_set) = &self.brush_set else { return };
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name("export.brushset")
+            .add_filter("Procreate Brushset", &["brushset"])
+            .save_file()
+        else {
+            return;
+        };
+        match procreate::export(brush_set, &path) {
+            Ok(()) => {
+                self.status = format!("Exported to {}", path.display());
+                self.error = None;
+            }
+            Err(err) => self.error = Some(err.to_string()),
+        }
+    }
+
     fn export_as_folder(&mut self) {
         let Some(brush_set) = &self.brush_set else { return };
         let Some(dir) = rfd::FileDialog::new()
@@ -150,6 +168,9 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     if ui.button("Export as .abr…").clicked() {
                         self.export_as_abr();
+                    }
+                    if ui.button("Export as .brushset…").clicked() {
+                        self.export_as_brushset();
                     }
                     if ui.button("Export as folder…").clicked() {
                         self.export_as_folder();

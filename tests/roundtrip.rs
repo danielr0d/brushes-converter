@@ -40,6 +40,29 @@ fn procreate_to_abr_round_trips_through_our_own_reader() {
 }
 
 #[test]
+fn procreate_round_trips_through_our_own_writer_and_reader() {
+    let brushset_bytes = std::fs::read(fixture("Rake_Brushpack.brushset")).unwrap();
+    let imported = procreate::import(&brushset_bytes).unwrap();
+    assert!(!imported.brushes.is_empty());
+
+    let exported_bytes = procreate::export_bytes(&imported).unwrap();
+    let reimported = procreate::import(&exported_bytes).unwrap();
+
+    assert_eq!(reimported.brushes.len(), imported.brushes.len());
+    for (original, round_tripped) in imported.brushes.iter().zip(&reimported.brushes) {
+        assert_eq!(round_tripped.name, original.name);
+        assert_eq!(round_tripped.tip.width, original.tip.width);
+        assert_eq!(round_tripped.tip.height, original.tip.height);
+        assert_eq!(round_tripped.tip.rgba, original.tip.rgba);
+        assert!((round_tripped.angle_deg - original.angle_deg).abs() < 0.01);
+        assert!((round_tripped.roundness_pct - original.roundness_pct).abs() < 0.01);
+        assert!((round_tripped.spacing_pct - original.spacing_pct).abs() < 0.01);
+        assert_eq!(round_tripped.pressure_sensitive_size, original.pressure_sensitive_size);
+        assert_eq!(round_tripped.pressure_sensitive_opacity, original.pressure_sensitive_opacity);
+    }
+}
+
+#[test]
 fn brushset_names_appear_in_the_original_photoshop_file() {
     // Not a byte-for-byte comparison (the ABR's own samp compression isn't
     // decoded by our reader), just a sanity check that the brush names in

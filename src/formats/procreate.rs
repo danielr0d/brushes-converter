@@ -11,7 +11,10 @@ use crate::error::{ConverterError, Result};
 use crate::nskeyed::{self, ValueExt};
 use crate::schema::{BrushSet, IntermediateBrush, RasterImage};
 use std::collections::BTreeMap;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
+use std::path::Path;
+use zip::write::SimpleFileOptions;
+use zip::ZipWriter;
 
 #[derive(Default)]
 struct BrushFiles {
@@ -84,6 +87,76 @@ pub fn import(bytes: &[u8]) -> Result<BrushSet> {
     }
 
     Ok(BrushSet { brushes })
+}
+
+/// Writes `brush_set` as a `.brushset` archive: one `<UUID>/` directory per
+/// brush holding `Brush.archive`, `Shape.png`, and an optional `Grain.png` —
+/// the same shape [`import`] reads back. `Brush.archive` is our own
+/// self-consistent NSKeyedArchiver encoding (see [`nskeyed::encode_root`]),
+/// not verified against a real Procreate install.
+pub fn export(brush_set: &BrushSet, path: &Path) -> Result<()> {
+    std::fs::write(path, export_bytes(brush_set)?)?;
+    Ok(())
+}
+
+pub fn export_bytes(brush_set: &BrushSet) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+    let options = SimpleFileOptions::default();
+
+    for brush in &brush_set.brushes {
+        let dir = uuid::Uuid::new_v4().to_string();
+
+        zip.start_file(format!("{dir}/Brush.archive"), options)?;
+        zip.write_all(&archive_bytes(brush)?)?;
+
+        zip.start_file(format!("{dir}/Shape.png"), options)?;
+        zip.write_all(&encode_png(&brush.tip)?)?;
+
+        if let Some(grain) = &brush.grain {
+            zip.start_file(format!("{dir}/Grain.png"), options)?;
+            zip.write_all(&encode_png(grain)?)?;
+        }
+    }
+
+    zip.finish()?;
+    Ok(buf)
+}
+
+fn archive_bytes(brush: &IntermediateBrush) -> Result<Vec<u8>> {
+    let mut fields = brush.extra.clone();
+
+    let carry_forward = |fields: &serde_json::Map<String, serde_json::Value>,
+                          key: &str,
+                          enabled: bool| {
+        if !enabled {
+            return 0.0;
+        }
+        fields
+            .get(key)
+            .and_then(serde_json::Value::as_f64)
+            .filter(|&v| v > 0.0)
+            .unwrap_or(1.0)
+    };
+    let pressure_size = carry_forward(&fields, "dynamicsPressureSize", brush.pressure_sensitive_size);
+    let pressure_opacity = carry_forward(&fields, "dynamicsPressureOpacity", brush.pressure_sensitive_opacity);
+
+    fields.insert("name".to_string(), brush.name.clone().into());
+    fields.insert("shapeAngle".to_string(), (brush.angle_deg as f64).to_radians().into());
+    fields.insert("shapeRoundness".to_string(), ((brush.roundness_pct as f64) / 100.0).into());
+    fields.insert("plotSpacing".to_string(), ((brush.spacing_pct as f64) / 100.0).into());
+    fields.insert("dynamicsPressureSize".to_string(), pressure_size.into());
+    fields.insert("dynamicsPressureOpacity".to_string(), pressure_opacity.into());
+
+    nskeyed::encode_root(&fields)
+}
+
+fn encode_png(image: &RasterImage) -> Result<Vec<u8>> {
+    let buf = image::RgbaImage::from_raw(image.width, image.height, image.rgba.clone())
+        .ok_or_else(|| ConverterError::Malformed("raster buffer length doesn't match its width/height".into()))?;
+    let mut out = Vec::new();
+    buf.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)?;
+    Ok(out)
 }
 
 fn decode_png(bytes: &[u8]) -> Result<RasterImage> {
