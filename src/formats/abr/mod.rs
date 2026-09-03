@@ -13,6 +13,13 @@
 //!     `sampledData`) — `sampledData` is the GUID that cross-references a
 //!     `samp` entry.
 //!
+//! Real files may have further `8BIM`-tagged sections after `desc` (e.g. a
+//! `phry` section observed in the fixture, contents unknown) — the reader
+//! skips any section it doesn't recognize. Each section's content is padded
+//! to a 4-byte boundary; failing to skip that padding misaligns every
+//! section read after an odd-length one (a real file's `desc` section was
+//! 47243 bytes, exposing this).
+//!
 //! The `desc` grammar was verified byte-exact (zero leftover bytes) against
 //! a real 47KB `desc` section. The `samp` per-entry layout is our own
 //! self-consistent construction inspired by, but not byte-identical to,
@@ -94,6 +101,8 @@ fn write_section(out: &mut Vec<u8>, key: &str, content: &[u8]) {
     out.extend_from_slice(key.as_bytes());
     out.extend_from_slice(&(content.len() as u32).to_be_bytes());
     out.extend_from_slice(content);
+    let pad = (4 - content.len() % 4) % 4; // sections are padded to a 4-byte boundary
+    out.extend(std::iter::repeat_n(0u8, pad));
 }
 
 /// Reads an `.abr` file written by [`export_bytes`] (or, best-effort, one
@@ -126,6 +135,7 @@ pub fn import(bytes: &[u8]) -> Result<BrushSet> {
             _ => {}
         }
         pos += len;
+        pos += (4 - len % 4) % 4; // sections are padded to a 4-byte boundary
     }
 
     let samp_bytes = samp_bytes.ok_or_else(|| ConverterError::Malformed("missing samp section".into()))?;
