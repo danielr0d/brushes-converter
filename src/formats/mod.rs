@@ -22,7 +22,7 @@ pub fn detect(path: &Path) -> Option<Format> {
     match ext.as_str() {
         "brush" | "brushset" => Some(Format::Procreate),
         "abr" => Some(Format::Abr),
-        "kbr" | "bundle" => Some(Format::Krita),
+        "kpp" | "bundle" => Some(Format::Krita),
         "sut" => Some(Format::Csp),
         _ => None,
     }

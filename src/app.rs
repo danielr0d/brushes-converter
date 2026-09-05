@@ -1,4 +1,4 @@
-use crate::formats::{self, abr, folder, procreate};
+use crate::formats::{self, abr, folder, krita, procreate};
 use crate::schema::BrushSet;
 use eframe::egui;
 use std::path::PathBuf;
@@ -56,7 +56,7 @@ impl App {
             .set_title("Open brush file")
             .add_filter(
                 "Brush files",
-                &["brush", "brushset", "abr", "sut", "kbr", "bundle"],
+                &["brush", "brushset", "abr", "sut", "kpp", "bundle"],
             )
             .add_filter("All files", &["*"])
             .pick_file()
@@ -97,6 +97,24 @@ impl App {
             return;
         };
         match procreate::export(brush_set, &path) {
+            Ok(()) => {
+                self.status = format!("Exported to {}", path.display());
+                self.error = None;
+            }
+            Err(err) => self.error = Some(err.to_string()),
+        }
+    }
+
+    fn export_as_krita_bundle(&mut self) {
+        let Some(brush_set) = &self.brush_set else { return };
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name("export.bundle")
+            .add_filter("Krita Resource Bundle", &["bundle"])
+            .save_file()
+        else {
+            return;
+        };
+        match krita::export(brush_set, &path) {
             Ok(()) => {
                 self.status = format!("Exported to {}", path.display());
                 self.error = None;
@@ -171,6 +189,9 @@ impl eframe::App for App {
                     }
                     if ui.button("Export as .brushset…").clicked() {
                         self.export_as_brushset();
+                    }
+                    if ui.button("Export as Krita bundle…").clicked() {
+                        self.export_as_krita_bundle();
                     }
                     if ui.button("Export as folder…").clicked() {
                         self.export_as_folder();
