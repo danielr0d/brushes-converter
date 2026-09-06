@@ -34,20 +34,310 @@
 //! kept consistent with this codebase's Procreate writer, which faced the
 //! same ambiguity for its own `shapeAngle` field).
 //!
-//! Import is not implemented — this module is export-only.
+//! Import reads both shapes back: a `.bundle` zip (scanning every
+//! `paintoppresets/*.kpp` entry, resolving each preset's raster tip against
+//! its sibling `brushes/<filename>` entry by the `brush_definition` param's
+//! `filename` attribute) and a bare `.kpp` PNG passed on its own (falling
+//! back to the `.kpp`'s own thumbnail raster as the tip, since without a
+//! bundle there's nowhere else to resolve the referenced brush file from —
+//! this is a real loss of fidelity for a standalone `.kpp`, not just a
+//! simplification). Only presets whose `brush_definition` is a
+//! `type="png_brush"` (a predefined raster tip stored as a plain PNG) map
+//! onto this schema; parametric (`auto_brush`) presets are skipped, and so
+//! is `gbr_brush` — confirmed against `RGBA_brushes.bundle`'s own two
+//! `gbr_brush` presets that it's used for a `.gih` (GIMP's animated
+//! multi-frame "image pipe") filename, not a `.gbr` single-frame brush, and
+//! this schema has no multi-frame tip to import it into regardless.
+//!
+//! The preset XML is parsed with a small hand-rolled scanner rather than a
+//! real XML library: real presets (checked against `RGBA_brushes.bundle`'s
+//! six shipped presets, see module-level export docs for provenance) nest
+//! nothing but opaque CDATA text one level deep — even a param's own nested
+//! "sensor" dynamics fragment is stored as a literal string, not as child
+//! elements the outer parser ever sees — so a flat scan for `<param
+//! type="..." name="...">value</param>` (value either `<![CDATA[...]]>` or,
+//! for the one observed non-string case, `bytearray`, plain base64 text) is
+//! enough. Confirmed against real files: attribute order is arbitrary (not
+//! alphabetical, unlike this module's own writer), and a real `<Brush>`
+//! element doesn't always carry `md5sum` — so attribute parsing is a
+//! generic name="value" scan, not a fixed-order match.
 
 use crate::error::{ConverterError, Result};
 use crate::schema::{BrushSet, IntermediateBrush, RasterImage};
-use std::collections::HashSet;
-use std::io::{Cursor, Write};
+use std::collections::{HashMap, HashSet};
+use std::io::{Cursor, Read, Write};
 use std::path::Path;
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
 const MIMETYPE: &str = "application/x-krita-resourcebundle";
 
-pub fn import(_bytes: &[u8]) -> Result<BrushSet> {
-    Err(ConverterError::NotImplemented("Krita"))
+pub fn import(bytes: &[u8]) -> Result<BrushSet> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        let brush = import_standalone_kpp(bytes)?;
+        return Ok(BrushSet { brushes: vec![brush] });
+    }
+    import_bundle(bytes)
+}
+
+/// Reads a `.bundle` zip: every `paintoppresets/*.kpp` entry becomes one
+/// brush, its tip resolved against `brushes/<filename>` by name.
+fn import_bundle(bytes: &[u8]) -> Result<BrushSet> {
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes))?;
+
+    let mut raster_index: HashMap<String, usize> = HashMap::new();
+    let mut preset_indices: Vec<usize> = Vec::new();
+    for i in 0..zip.len() {
+        let name = zip.by_index(i)?.name().to_string();
+        if let Some(base) = name.strip_prefix("brushes/") {
+            raster_index.insert(base.to_string(), i);
+        } else if name.starts_with("paintoppresets/") && name.ends_with(".kpp") {
+            preset_indices.push(i);
+        }
+    }
+
+    let mut brushes = Vec::new();
+    for idx in preset_indices {
+        let mut kpp_bytes = Vec::new();
+        zip.by_index(idx)?.read_to_end(&mut kpp_bytes)?;
+
+        let preset_xml = read_kpp_preset_xml(&kpp_bytes)?;
+        let preset = parse_preset_xml(&preset_xml)?;
+        let Some(brush_def) = preset.params.get("brush_definition") else {
+            continue; // no raster brush attached to this preset at all
+        };
+        let brush_attrs = parse_attrs(brush_def);
+        if brush_attrs.get("type").map(String::as_str) != Some("png_brush") {
+            continue; // parametric/pipe brush — no single raster tip to import
+        }
+
+        let tip = match brush_attrs.get("filename").and_then(|f| raster_index.get(f)) {
+            Some(&ridx) => {
+                let mut raster_bytes = Vec::new();
+                zip.by_index(ridx)?.read_to_end(&mut raster_bytes)?;
+                decode_png(&raster_bytes)?
+            }
+            None => decode_png(&kpp_bytes)?, // fall back to the preset's own thumbnail
+        };
+
+        brushes.push(brush_from_preset(&preset, &brush_attrs, tip));
+    }
+
+    if brushes.is_empty() {
+        return Err(ConverterError::Malformed(
+            "no importable (raster) presets found in Krita bundle".into(),
+        ));
+    }
+    Ok(BrushSet { brushes })
+}
+
+/// Reads a bare `.kpp` PNG with no surrounding bundle. Its own raster is the
+/// only tip available, so it's used as-is (see module docs on fidelity).
+fn import_standalone_kpp(bytes: &[u8]) -> Result<IntermediateBrush> {
+    let preset_xml = read_kpp_preset_xml(bytes)?;
+    let preset = parse_preset_xml(&preset_xml)?;
+    let brush_attrs = preset
+        .params
+        .get("brush_definition")
+        .map(|s| parse_attrs(s))
+        .unwrap_or_default();
+    let tip = decode_png(bytes)?;
+    Ok(brush_from_preset(&preset, &brush_attrs, tip))
+}
+
+/// The settings XML held in a `.kpp`'s zlib-compressed `preset` `zTXt` chunk.
+fn read_kpp_preset_xml(bytes: &[u8]) -> Result<String> {
+    let decoder = png::Decoder::new(Cursor::new(bytes));
+    let reader = decoder
+        .read_info()
+        .map_err(|e| ConverterError::Malformed(format!("failed reading .kpp PNG header: {e}")))?;
+    let chunk = reader
+        .info()
+        .compressed_latin1_text
+        .iter()
+        .find(|t| t.keyword == "preset")
+        .ok_or_else(|| ConverterError::Malformed(".kpp file has no 'preset' zTXt chunk".into()))?;
+    chunk
+        .get_text()
+        .map_err(|e| ConverterError::Malformed(format!("failed decompressing .kpp preset chunk: {e}")))
+}
+
+struct PresetXml {
+    paintopid: String,
+    name: String,
+    params: HashMap<String, String>,
+}
+
+/// Parses `<Preset paintopid="..." name="...">` and its flat `<param
+/// type="..." name="...">value</param>` children (see module docs for why a
+/// flat scan is enough for this shape).
+fn parse_preset_xml(xml: &str) -> Result<PresetXml> {
+    let malformed = || ConverterError::Malformed("malformed Krita preset XML".into());
+
+    let preset_tag_end = xml.find('>').ok_or_else(malformed)?;
+    let preset_attrs = parse_attrs(&xml[..preset_tag_end]);
+    let paintopid = preset_attrs.get("paintopid").cloned().unwrap_or_default();
+    let name = preset_attrs.get("name").cloned().unwrap_or_default();
+
+    let mut params = HashMap::new();
+    let mut rest = &xml[preset_tag_end + 1..];
+    while let Some(tag_start) = rest.find("<param ") {
+        let after_tag = &rest[tag_start..];
+        let tag_end = after_tag.find('>').ok_or_else(malformed)?;
+        let param_attrs = parse_attrs(&after_tag[..tag_end]);
+        let param_name = param_attrs.get("name").cloned().unwrap_or_default();
+
+        let content = &after_tag[tag_end + 1..];
+        let (value, content_len) = if let Some(cdata) = content.strip_prefix("<![CDATA[") {
+            let end = cdata.find("]]>").ok_or_else(malformed)?;
+            (cdata[..end].to_string(), "<![CDATA[".len() + end + "]]>".len())
+        } else {
+            let end = content.find("</param>").ok_or_else(malformed)?;
+            (xml_unescape(&content[..end]), end + "</param>".len())
+        };
+        params.insert(param_name, value);
+        rest = &content[content_len..];
+    }
+
+    Ok(PresetXml { paintopid, name, params })
+}
+
+fn brush_from_preset(
+    preset: &PresetXml,
+    brush_attrs: &HashMap<String, String>,
+    tip: RasterImage,
+) -> IntermediateBrush {
+    let spacing_frac: f32 = brush_attrs
+        .get("spacing")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.1);
+    let angle_rad: f64 = brush_attrs
+        .get("angle")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    let bool_param = |name: &str| preset.params.get(name).map(|v| v == "true").unwrap_or(false);
+
+    let mut extra = serde_json::Map::new();
+    for (k, v) in &preset.params {
+        extra.insert(k.clone(), v.clone().into());
+    }
+    extra.insert("paintopid".to_string(), preset.paintopid.clone().into());
+
+    IntermediateBrush {
+        name: if preset.name.is_empty() { "Untitled Brush".to_string() } else { preset.name.clone() },
+        diameter_px: tip.width as f32,
+        tip,
+        grain: None,
+        angle_deg: angle_rad.to_degrees() as f32,
+        roundness_pct: 100.0,
+        spacing_pct: spacing_frac * 100.0,
+        interpolate: true,
+        flip_x: false,
+        flip_y: false,
+        pressure_sensitive_size: bool_param("PressureSize"),
+        pressure_sensitive_opacity: bool_param("PressureOpacity"),
+        extra,
+    }
+}
+
+/// Generic `name="value"` attribute scan over a tag's inner text (the part
+/// between `<Tag` and its closing `>`/`/>`), unescaping each value. Real
+/// Krita XML doesn't keep attributes in a fixed order (unlike this module's
+/// own writer), so this doesn't assume one.
+fn parse_attrs(tag: &str) -> HashMap<String, String> {
+    let mut attrs = HashMap::new();
+    let bytes = tag.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            i += 1;
+        }
+        let name_start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-' | b'/' | b':')) {
+            i += 1;
+        }
+        if i == name_start {
+            break;
+        }
+        let name = &tag[name_start..i];
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'"' {
+            continue;
+        }
+        i += 1;
+        let val_start = i;
+        while i < bytes.len() && bytes[i] != b'"' {
+            i += 1;
+        }
+        let value = xml_unescape(&tag[val_start..i]);
+        i += 1;
+        attrs.insert(name.to_string(), value);
+    }
+    attrs
+}
+
+/// Reverse of [`xml_escape`]: named entities plus numeric `&#x..;`/`&#..;`
+/// references. An unterminated `&` (no `;` within a sane lookahead) is left
+/// as literal text rather than treated as an error — real text content
+/// isn't guaranteed entity-clean.
+fn xml_unescape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '&' {
+            out.push(c);
+            continue;
+        }
+        let mut entity = String::new();
+        let mut closed = false;
+        for c2 in chars.by_ref() {
+            if c2 == ';' {
+                closed = true;
+                break;
+            }
+            entity.push(c2);
+            if entity.len() > 12 {
+                break;
+            }
+        }
+        if !closed {
+            out.push('&');
+            out.push_str(&entity);
+            continue;
+        }
+        match entity.as_str() {
+            "amp" => out.push('&'),
+            "lt" => out.push('<'),
+            "gt" => out.push('>'),
+            "quot" => out.push('"'),
+            "apos" => out.push('\''),
+            _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+                if let Some(ch) = u32::from_str_radix(&entity[2..], 16).ok().and_then(char::from_u32) {
+                    out.push(ch);
+                }
+            }
+            _ if entity.starts_with('#') => {
+                if let Some(ch) = entity[1..].parse::<u32>().ok().and_then(char::from_u32) {
+                    out.push(ch);
+                }
+            }
+            _ => {
+                out.push('&');
+                out.push_str(&entity);
+                out.push(';');
+            }
+        }
+    }
+    out
 }
 
 /// Writes `brush_set` as a `.bundle` archive: one `brushes/<name>.png` +
@@ -211,6 +501,12 @@ fn encode_png(image: &RasterImage) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+fn decode_png(bytes: &[u8]) -> Result<RasterImage> {
+    let img = image::load_from_memory(bytes)?.into_rgba8();
+    let (width, height) = img.dimensions();
+    Ok(RasterImage { width, height, rgba: img.into_raw() })
+}
+
 fn md5_hex(bytes: &[u8]) -> String {
     format!("{:x}", md5::compute(bytes))
 }
@@ -341,5 +637,104 @@ mod tests {
         let xml = preset_xml(&b, "stem.png", "deadbeef");
         assert!(xml.is_ascii());
         assert!(xml.contains("name=\"caf&#xE9;\""));
+    }
+
+    #[test]
+    fn round_trips_through_our_own_writer_and_reader() {
+        let mut b = brush("caf\u{00e9} Marker");
+        b.angle_deg = 30.0;
+        let brush_set = BrushSet { brushes: vec![b, brush("Round Marker")] };
+
+        let bytes = export_bytes(&brush_set).unwrap();
+        let reimported = import(&bytes).unwrap();
+
+        assert_eq!(reimported.brushes.len(), 2);
+        for (original, round_tripped) in brush_set.brushes.iter().zip(&reimported.brushes) {
+            assert_eq!(round_tripped.name, original.name);
+            assert_eq!(round_tripped.tip.width, original.tip.width);
+            assert_eq!(round_tripped.tip.height, original.tip.height);
+            assert_eq!(round_tripped.tip.rgba, original.tip.rgba);
+            assert!((round_tripped.angle_deg - original.angle_deg).abs() < 0.01);
+            assert!((round_tripped.spacing_pct - original.spacing_pct).abs() < 0.1);
+            assert_eq!(round_tripped.pressure_sensitive_size, original.pressure_sensitive_size);
+            assert_eq!(round_tripped.pressure_sensitive_opacity, original.pressure_sensitive_opacity);
+        }
+    }
+
+    #[test]
+    fn import_falls_back_to_the_kpp_thumbnail_when_standalone() {
+        let brush_set = BrushSet { brushes: vec![brush("Solo")] };
+        let bytes = export_bytes(&brush_set).unwrap();
+        let mut zip = ZipArchive::new(Cursor::new(bytes.as_slice())).unwrap();
+        let mut kpp_bytes = Vec::new();
+        zip.by_name("paintoppresets/Solo.kpp").unwrap().read_to_end(&mut kpp_bytes).unwrap();
+
+        let reimported = import(&kpp_bytes).unwrap();
+        assert_eq!(reimported.brushes.len(), 1);
+        assert_eq!(reimported.brushes[0].name, "Solo");
+        assert_eq!(reimported.brushes[0].tip.width, 4);
+    }
+
+    #[test]
+    fn skips_non_raster_presets_but_keeps_raster_ones() {
+        let brush_set = BrushSet { brushes: vec![brush("Raster One")] };
+        let bytes = export_bytes(&brush_set).unwrap();
+        let mut zip = ZipArchive::new(Cursor::new(bytes.as_slice())).unwrap();
+
+        // Splice in a second, parametric-brush preset entry with no matching
+        // brushes/ raster, alongside the real raster one.
+        let mut buf = Vec::new();
+        {
+            let mut new_zip = ZipWriter::new(Cursor::new(&mut buf));
+            let options = SimpleFileOptions::default();
+            for i in 0..zip.len() {
+                let mut file = zip.by_index(i).unwrap();
+                let name = file.name().to_string();
+                let mut contents = Vec::new();
+                file.read_to_end(&mut contents).unwrap();
+                new_zip.start_file(&name, options).unwrap();
+                new_zip.write_all(&contents).unwrap();
+            }
+            let parametric_xml = "<Preset paintopid=\"paintbrush\" name=\"Parametric\">\
+                <param type=\"string\" name=\"brush_definition\">\
+                <![CDATA[<Brush type=\"auto_brush\" diameter=\"20\"/>]]></param></Preset>";
+            let parametric_kpp = encode_kpp_raw(parametric_xml);
+            new_zip.start_file("paintoppresets/Parametric.kpp", options).unwrap();
+            new_zip.write_all(&parametric_kpp).unwrap();
+            new_zip.finish().unwrap();
+        }
+
+        let reimported = import(&buf).unwrap();
+        assert_eq!(reimported.brushes.len(), 1);
+        assert_eq!(reimported.brushes[0].name, "Raster One");
+    }
+
+    fn encode_kpp_raw(preset_xml: &str) -> Vec<u8> {
+        let tip = RasterImage { width: 2, height: 2, rgba: vec![255; 2 * 2 * 4] };
+        let mut buf = Vec::new();
+        let mut encoder = png::Encoder::new(&mut buf, tip.width, tip.height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.add_ztxt_chunk("preset".to_string(), preset_xml.to_string()).unwrap();
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&tip.rgba).unwrap();
+        drop(writer);
+        buf
+    }
+
+    #[test]
+    fn xml_unescape_reverses_xml_escape() {
+        let escaped = xml_escape("caf\u{00e9} \"quoted\" & <tag>");
+        assert_eq!(xml_unescape(&escaped), "caf\u{00e9} \"quoted\" & <tag>");
+    }
+
+    #[test]
+    fn parse_attrs_reads_out_of_order_attributes() {
+        let attrs = parse_attrs(
+            "<Brush scale=\"1.03\" filename=\"DA_RGBA bluegreen_small1.png\" type=\"png_brush\" angle=\"0\"",
+        );
+        assert_eq!(attrs.get("filename").unwrap(), "DA_RGBA bluegreen_small1.png");
+        assert_eq!(attrs.get("type").unwrap(), "png_brush");
+        assert_eq!(attrs.get("scale").unwrap(), "1.03");
     }
 }

@@ -4,7 +4,7 @@
 //! `RakeBrushpackPhotoshopFinal.abr` itself, since that file is this
 //! brushset's known origin (every brush in it has `importedFromABR: true`).
 
-use brushes_converter::formats::{abr, procreate};
+use brushes_converter::formats::{abr, krita, procreate};
 
 fn fixture(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -91,4 +91,36 @@ fn brushset_names_appear_in_the_original_photoshop_file() {
         matched > 0,
         "expected at least one Procreate brush name to appear in the source .abr"
     );
+}
+
+#[test]
+fn imports_the_real_krita_bundle_end_to_end() {
+    // `RGBA_brushes.bundle` is a real Krita-authored bundle fetched from
+    // krita/data/bundles/RGBA_brushes.bundle in the KDE/krita repo (see
+    // src/formats/krita.rs's module docs and the krita-bundle-schema-reference
+    // memory for provenance). It ships 6 presets: 4 are `png_brush` (a plain
+    // PNG pixel tip, referencing brushes/*.png) and import cleanly; the other
+    // 2 (Impasto/Impasto-details) are `gbr_brush` referencing a `.gih` file
+    // (GIMP's animated multi-frame "image pipe" format, not a plain PNG) and
+    // are correctly skipped — this schema has no way to represent an
+    // animated multi-frame tip, and `.gih` isn't PNG-decodable regardless.
+    let bundle_bytes = std::fs::read(fixture("RGBA_brushes.bundle")).unwrap();
+    let imported = krita::import(&bundle_bytes).unwrap();
+
+    assert_eq!(imported.brushes.len(), 4);
+
+    let names: Vec<&str> = imported.brushes.iter().map(|b| b.name.as_str()).collect();
+    assert!(names.contains(&"m)_RGBA_01_Thick-dry"));
+    assert!(names.contains(&"m)_RGBA_03_Rake"));
+
+    for brush in &imported.brushes {
+        assert!(brush.tip.width > 0 && brush.tip.height > 0);
+        // The tip must be the actual referenced brush raster, not the .kpp's
+        // own UI-thumbnail raster (a different, much larger preview image).
+        assert!(brush.tip.rgba.iter().any(|&b| b != 0), "tip for '{}' is blank", brush.name);
+        assert!(brush.spacing_pct > 0.0);
+    }
+
+    let rake = imported.brushes.iter().find(|b| b.name == "m)_RGBA_03_Rake").unwrap();
+    assert!((rake.spacing_pct - 3.0).abs() < 0.5, "spacing_pct was {}", rake.spacing_pct);
 }
