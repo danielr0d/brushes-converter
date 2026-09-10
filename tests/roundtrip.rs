@@ -124,3 +124,31 @@ fn imports_the_real_krita_bundle_end_to_end() {
     let rake = imported.brushes.iter().find(|b| b.name == "m)_RGBA_03_Rake").unwrap();
     assert!((rake.spacing_pct - 3.0).abs() < 0.5, "spacing_pct was {}", rake.spacing_pct);
 }
+
+#[test]
+fn imports_the_real_photoshop_abr_end_to_end() {
+    // Unlike the round-trip tests above (which only validate our writer
+    // against our own reader), this decodes RakeBrushpackPhotoshopFinal.abr
+    // itself: real Adobe-authored `desc` descriptors cross-referencing real
+    // Adobe-authored `samp` rasters, including live PackBits decompression.
+    let abr_bytes = std::fs::read(fixture("RakeBrushpackPhotoshopFinal.abr")).unwrap();
+    let imported = abr::import(&abr_bytes).unwrap();
+
+    // The desc section lists 28 brush presets, several of which reuse the
+    // same underlying sampled tip (fewer than 28 samp entries exist).
+    assert_eq!(imported.brushes.len(), 28);
+
+    let first = &imported.brushes[0];
+    assert_eq!(first.name, "Very Basic Rake");
+    assert!((first.diameter_px - 700.0).abs() < 0.01);
+    assert!(first.tip.width > 0 && first.tip.height > 0);
+
+    // Every decoded tip should be non-degenerate: real pixel data, not an
+    // empty or uniform mask.
+    for brush in &imported.brushes {
+        assert!(brush.tip.width > 0 && brush.tip.height > 0);
+        let mask = brush.tip.to_alpha_mask();
+        assert_eq!(mask.len(), (brush.tip.width * brush.tip.height) as usize);
+        assert!(mask.iter().any(|&b| b != 0), "brush {} decoded to an all-zero tip", brush.name);
+    }
+}
