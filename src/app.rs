@@ -3,11 +3,38 @@ use crate::schema::BrushSet;
 use eframe::egui;
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportFormat {
+    Abr,
+    Brushset,
+    KritaBundle,
+    Folder,
+}
+
+impl ExportFormat {
+    const ALL: [ExportFormat; 4] = [
+        ExportFormat::Abr,
+        ExportFormat::Brushset,
+        ExportFormat::KritaBundle,
+        ExportFormat::Folder,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            ExportFormat::Abr => "Photoshop (.abr)",
+            ExportFormat::Brushset => "Procreate (.brushset)",
+            ExportFormat::KritaBundle => "Krita bundle (.bundle)",
+            ExportFormat::Folder => "Folder (PNG + settings.json)",
+        }
+    }
+}
+
 pub struct App {
     brush_set: Option<BrushSet>,
     textures: Vec<egui::TextureHandle>,
     status: String,
     error: Option<String>,
+    export_format: ExportFormat,
 }
 
 impl Default for App {
@@ -17,6 +44,7 @@ impl Default for App {
             textures: Vec::new(),
             status: "Drop a brush file here, or click \"Open file…\"".to_string(),
             error: None,
+            export_format: ExportFormat::Abr,
         }
     }
 }
@@ -139,6 +167,15 @@ impl App {
             Err(err) => self.error = Some(err.to_string()),
         }
     }
+
+    fn export_selected(&mut self) {
+        match self.export_format {
+            ExportFormat::Abr => self.export_as_abr(),
+            ExportFormat::Brushset => self.export_as_brushset(),
+            ExportFormat::KritaBundle => self.export_as_krita_bundle(),
+            ExportFormat::Folder => self.export_as_folder(),
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -184,17 +221,16 @@ impl eframe::App for App {
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Export as .abr…").clicked() {
-                        self.export_as_abr();
-                    }
-                    if ui.button("Export as .brushset…").clicked() {
-                        self.export_as_brushset();
-                    }
-                    if ui.button("Export as Krita bundle…").clicked() {
-                        self.export_as_krita_bundle();
-                    }
-                    if ui.button("Export as folder…").clicked() {
-                        self.export_as_folder();
+                    ui.label("Convert into:");
+                    egui::ComboBox::new("export_format", "")
+                        .selected_text(self.export_format.label())
+                        .show_ui(ui, |ui| {
+                            for format in ExportFormat::ALL {
+                                ui.selectable_value(&mut self.export_format, format, format.label());
+                            }
+                        });
+                    if ui.button("Export…").clicked() {
+                        self.export_selected();
                     }
                 });
             } else {
