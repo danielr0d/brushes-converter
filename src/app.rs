@@ -98,6 +98,7 @@ impl ExportFormat {
 pub struct App {
     brush_set: Option<BrushSet>,
     textures: Vec<egui::TextureHandle>,
+    selected: Vec<bool>,
     status: String,
     error: Option<String>,
     export_format: ExportFormat,
@@ -108,6 +109,7 @@ impl Default for App {
         App {
             brush_set: None,
             textures: Vec::new(),
+            selected: Vec::new(),
             status: "Drop a brush file here, or click \"Open file…\"".to_string(),
             error: None,
             export_format: ExportFormat::Abr,
@@ -136,12 +138,35 @@ impl App {
                     brush_set.brushes.len(),
                     path.display()
                 );
+                self.selected = vec![true; brush_set.brushes.len()];
                 self.error = None;
                 self.brush_set = Some(brush_set);
             }
             Err(err) => {
                 self.error = Some(err.to_string());
             }
+        }
+    }
+
+    fn selected_count(&self) -> usize {
+        self.selected.iter().filter(|&&s| s).count()
+    }
+
+    /// Builds a `BrushSet` containing only the checked brushes, or `None` if
+    /// nothing is selected (exporting an empty set would be a silent no-op).
+    fn build_export_set(&self) -> Option<BrushSet> {
+        let brush_set = self.brush_set.as_ref()?;
+        let brushes: Vec<_> = brush_set
+            .brushes
+            .iter()
+            .zip(&self.selected)
+            .filter(|(_, &selected)| selected)
+            .map(|(brush, _)| brush.clone())
+            .collect();
+        if brushes.is_empty() {
+            None
+        } else {
+            Some(BrushSet { brushes })
         }
     }
 
@@ -164,7 +189,10 @@ impl App {
     }
 
     fn export_as_abr(&mut self) {
-        let Some(brush_set) = &self.brush_set else { return };
+        let Some(brush_set) = self.build_export_set() else {
+            self.error = Some("Select at least one brush to export".to_string());
+            return;
+        };
         let Some(path) = rfd::FileDialog::new()
             .set_file_name("export.abr")
             .add_filter("Photoshop Brush", &["abr"])
@@ -172,7 +200,7 @@ impl App {
         else {
             return;
         };
-        match abr::export(brush_set, &path) {
+        match abr::export(&brush_set, &path) {
             Ok(()) => {
                 self.status = format!("Exported to {}", path.display());
                 self.error = None;
@@ -182,7 +210,10 @@ impl App {
     }
 
     fn export_as_brushset(&mut self) {
-        let Some(brush_set) = &self.brush_set else { return };
+        let Some(brush_set) = self.build_export_set() else {
+            self.error = Some("Select at least one brush to export".to_string());
+            return;
+        };
         let Some(path) = rfd::FileDialog::new()
             .set_file_name("export.brushset")
             .add_filter("Procreate Brushset", &["brushset"])
@@ -190,7 +221,7 @@ impl App {
         else {
             return;
         };
-        match procreate::export(brush_set, &path) {
+        match procreate::export(&brush_set, &path) {
             Ok(()) => {
                 self.status = format!("Exported to {}", path.display());
                 self.error = None;
@@ -200,7 +231,10 @@ impl App {
     }
 
     fn export_as_krita_bundle(&mut self) {
-        let Some(brush_set) = &self.brush_set else { return };
+        let Some(brush_set) = self.build_export_set() else {
+            self.error = Some("Select at least one brush to export".to_string());
+            return;
+        };
         let Some(path) = rfd::FileDialog::new()
             .set_file_name("export.bundle")
             .add_filter("Krita Resource Bundle", &["bundle"])
@@ -208,7 +242,7 @@ impl App {
         else {
             return;
         };
-        match krita::export(brush_set, &path) {
+        match krita::export(&brush_set, &path) {
             Ok(()) => {
                 self.status = format!("Exported to {}", path.display());
                 self.error = None;
@@ -218,14 +252,17 @@ impl App {
     }
 
     fn export_as_folder(&mut self) {
-        let Some(brush_set) = &self.brush_set else { return };
+        let Some(brush_set) = self.build_export_set() else {
+            self.error = Some("Select at least one brush to export".to_string());
+            return;
+        };
         let Some(dir) = rfd::FileDialog::new()
             .set_title("Choose export folder")
             .pick_folder()
         else {
             return;
         };
-        match folder::export(brush_set, &dir) {
+        match folder::export(&brush_set, &dir) {
             Ok(()) => {
                 self.status = format!("Exported to {}", dir.display());
                 self.error = None;
@@ -272,26 +309,40 @@ impl eframe::App for App {
                 });
             });
 
-        if self.brush_set.is_some() {
+        if let Some(brush_set) = &self.brush_set {
+            let total = brush_set.brushes.len();
+            let selected_count = self.selected_count();
             egui::TopBottomPanel::bottom("export_bar")
                 .frame(bar_frame())
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label("Convert into:");
-                        egui::ComboBox::new("export_format", "")
-                            .selected_text(self.export_format.label())
-                            .show_ui(ui, |ui| {
-                                for format in ExportFormat::ALL {
-                                    ui.selectable_value(
-                                        &mut self.export_format,
-                                        format,
-                                        format.label(),
-                                    );
-                                }
-                            });
-                        if ui.button("Export…").clicked() {
-                            self.export_selected();
+                        if ui.button("Select all").clicked() {
+                            self.selected.iter_mut().for_each(|s| *s = true);
                         }
+                        if ui.button("Select none").clicked() {
+                            self.selected.iter_mut().for_each(|s| *s = false);
+                        }
+                        ui.colored_label(
+                            COLOR_MUTED_TEXT,
+                            format!("{selected_count} of {total} selected"),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Export…").clicked() {
+                                self.export_selected();
+                            }
+                            egui::ComboBox::new("export_format", "")
+                                .selected_text(self.export_format.label())
+                                .show_ui(ui, |ui| {
+                                    for format in ExportFormat::ALL {
+                                        ui.selectable_value(
+                                            &mut self.export_format,
+                                            format,
+                                            format.label(),
+                                        );
+                                    }
+                                });
+                            ui.label("Convert into:");
+                        });
                     });
                 });
         }
@@ -324,16 +375,21 @@ impl eframe::App for App {
                 ui.add_space(12.0);
 
                 if let Some(brush_set) = &self.brush_set {
+                    let textures = &self.textures;
+                    let selected = &mut self.selected;
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.horizontal_wrapped(|ui| {
-                                for (brush, texture) in
-                                    brush_set.brushes.iter().zip(&self.textures)
+                                for (i, (brush, texture)) in
+                                    brush_set.brushes.iter().zip(textures).enumerate()
                                 {
                                     card_frame().show(ui, |ui| {
                                         ui.set_width(100.0);
                                         ui.vertical(|ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.checkbox(&mut selected[i], "");
+                                            });
                                             ui.add(
                                                 egui::Image::new(texture)
                                                     .fit_to_exact_size(egui::vec2(72.0, 72.0)),
